@@ -1,54 +1,97 @@
-#Requires AutoHotkey v2.0
+﻿#Requires AutoHotkey v2.0
 #SingleInstance Force
 
 ; ─── Global State ───
 clipQueue := []
 isPasting := false
 prevText := ""
-currentHotkey := ""
 autoExit := true
+injectMode := "input"
+apiBase := ""
 configFile := A_ScriptDir "\config.ini"
 
+; ─── Hotkey ───
+#InputLevel 1
+^v:: PasteHandler
+#InputLevel 0
+
 ; ─── Initialization ───
+apiBase := ReadApiBase(A_Args.Length > 0 ? A_Args[1] : "")
 ReadConfig()
-RegisterHotkey()
 try prevText := A_Clipboard
 SetTimer(WatchClipboard, 300)
 SetupTrayMenu()
+DebugLog("START v1.2.4 | apiBase=" (apiBase = "" ? "(none)" : apiBase) " | mode=" injectMode)
+BoxNotify("success", "连续粘贴启动成功，请先复制多段文本，再按 Ctrl+V 逐条粘贴")
+
+; ─── Box API ───
+ReadApiBase(paramPath) {
+    if (paramPath = "" || !FileExist(paramPath))
+        return ""
+    try content := FileRead(paramPath, "UTF-8")
+    catch
+        return ""
+    if RegExMatch(content, '"api_base"\s*:\s*"([^"]+)"', &m)
+        return m[1]
+    return ""
+}
+
+BoxNotify(type, message) {
+    global apiBase
+    if (apiBase = "") {
+        TrayTip(message, "连续粘贴", "Iconi")
+        SetTimer(() => TrayTip(), -3000)
+        return
+    }
+    try {
+        whr := ComObject("WinHttp.WinHttpRequest.5.1")
+        whr.SetTimeouts(1000, 1000, 1000, 1000)
+        whr.Open("POST", apiBase "/api/notify", false)
+        whr.SetRequestHeader("Content-Type", "application/json")
+        whr.Send('{"notify_type":"' type '","message":"' JsonEscape(message) '"}')
+    }
+}
+
+JsonEscape(s) {
+    s := StrReplace(s, "\", "\\")
+    s := StrReplace(s, '"', '\"')
+    s := StrReplace(s, "`n", "\n")
+    s := StrReplace(s, "`r", "\r")
+    s := StrReplace(s, "`t", "\t")
+    return s
+}
+
+DebugLog(msg) {
+    try FileAppend(FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss") " | " msg "`n", A_Temp "\cp_debug.log", "UTF-8")
+}
 
 ; ─── Config ───
 ReadConfig() {
-    global currentHotkey, autoExit
+    global autoExit, injectMode
     if !FileExist(configFile) {
-        currentHotkey := "^Numpad0"
         autoExit := true
+        injectMode := "input"
         WriteConfig()
         return
     }
-    currentHotkey := IniRead(configFile, "Settings", "Hotkey", "^Numpad0")
     autoExit := (IniRead(configFile, "Settings", "AutoExit", "true") = "true")
+    injectMode := IniRead(configFile, "Settings", "SendMode", "input")
+    if (injectMode != "input" && injectMode != "play" && injectMode != "control")
+        injectMode := "input"
 }
 
 WriteConfig() {
-    IniWrite(currentHotkey, configFile, "Settings", "Hotkey")
+    global autoExit, injectMode
     IniWrite(autoExit ? "true" : "false", configFile, "Settings", "AutoExit")
-}
-
-RegisterHotkey() {
-    global currentHotkey
-    try Hotkey(currentHotkey, "Off")
-    try {
-        Hotkey(currentHotkey, PasteHandler)
-    } catch {
-        TrayTip("快捷键 " currentHotkey " 无效，已恢复默认。", "连续粘贴", "Iconi")
-        currentHotkey := "^Numpad0"
-        WriteConfig()
-        Hotkey(currentHotkey, PasteHandler)
-    }
+    IniWrite(injectMode, configFile, "Settings", "SendMode")
 }
 
 ; ─── Clipboard Monitor ───
 WatchClipboard() {
+    EnqueueClipboard()
+}
+
+EnqueueClipboard() {
     global clipQueue, isPasting, prevText
     if isPasting
         return
@@ -61,55 +104,113 @@ WatchClipboard() {
     }
 }
 
-; ─── Paste Handler ───
+; ─── Paste Handler (Ctrl+V) ───
 PasteHandler(*) {
-    global clipQueue, isPasting, prevText, autoExit
-    if clipQueue.Length = 0 {
-        TrayTip("队列为空，请先复制文本。", "连续粘贴", "Iconi")
-        SetTimer(() => TrayTip(), -2000)
+    global clipQueue, isPasting, prevText, autoExit, injectMode
+    if isPasting
         return
-    }
     isPasting := true
-    text := clipQueue.RemoveAt(1)
-    A_Clipboard := text
-    if !ClipWait(1) {
-        isPasting := false
-        TrayTip("剪贴板写入超时，请重试。", "连续粘贴", "Iconi")
-        SetTimer(() => TrayTip(), -2000)
-        return
+    DebugLog("HOTKEY FIRED | queue=" clipQueue.Length " | mode=" injectMode)
+    pasted := false
+    if clipQueue.Length > 0 {
+        text := clipQueue.RemoveAt(1)
+        A_Clipboard := text
+        if !ClipWait(1) {
+            isPasting := false
+            DebugLog("CLIPBOARD WRITE TIMEOUT")
+            BoxNotify("error", "剪贴板写入超时，请重试。")
+            return
+        }
+        pasted := true
     }
-    SendInput("^v")
-    Sleep(150)
-    try prevText := A_Clipboard
+    SendLevel(0)
+    InjectPaste()
+    Sleep(50)
+    DebugLog("INJECTED | mode=" injectMode)
     isPasting := false
+    try prevText := A_Clipboard
     UpdateTrayTip()
-    if clipQueue.Length = 0 {
-        TrayTip("全部粘贴完成，队列已清空。", "连续粘贴", "Iconi")
+    if pasted && clipQueue.Length = 0 {
+        BoxNotify("success", "全部粘贴完成，队列已清空。")
         if autoExit
             SetTimer(() => ExitApp(), -2000)
     }
 }
 
+InjectPaste() {
+    global injectMode
+    switch injectMode {
+        case "play":
+            SendMode("Play")
+            Send("^v")
+            SendMode("Input")
+        case "control":
+            ctrl := ""
+            try ctrl := ControlGetFocus("A")
+            ControlSend("^v", ctrl, "A")
+        default:
+            SendInput("^v")
+    }
+}
+
 ; ─── Tray ───
 SetupTrayMenu() {
+    global compatMenu, autoExit
+    compatMenu := Menu()
+    compatMenu.Add("SendInput（默认）", (*) => SetSendMode("input"))
+    compatMenu.Add("SendPlay", (*) => SetSendMode("play"))
+    compatMenu.Add("ControlSend", (*) => SetSendMode("control"))
     A_TrayMenu.Delete()
     A_TrayMenu.Add("查看队列 (&1)", ShowQueue)
     A_TrayMenu.Add("清空队列 (&2)", ClearQueue)
     A_TrayMenu.Add()
-    A_TrayMenu.Add("设置 (&4)", ShowSettings)
-    A_TrayMenu.Add("重新加载 (&5)", (*) => Reload())
+    A_TrayMenu.Add("自动退出 (&3)", ToggleAutoExit)
+    A_TrayMenu.Add("重新加载 (&4)", (*) => Reload())
     A_TrayMenu.Add()
-    A_TrayMenu.Add("退出 (&3)", (*) => ExitApp())
+    A_TrayMenu.Add("兼容模式 (&6)", compatMenu)
+    A_TrayMenu.Add()
+    A_TrayMenu.Add("退出 (&5)", (*) => ExitApp())
+    if autoExit
+        A_TrayMenu.Check("自动退出 (&3)")
+    UpdateCompatChecks()
     UpdateTrayTip()
 }
 
+UpdateCompatChecks() {
+    global compatMenu, injectMode
+    compatMenu.Uncheck("SendInput（默认）")
+    compatMenu.Uncheck("SendPlay")
+    compatMenu.Uncheck("ControlSend")
+    switch injectMode {
+        case "play": compatMenu.Check("SendPlay")
+        case "control": compatMenu.Check("ControlSend")
+        default: compatMenu.Check("SendInput（默认）")
+    }
+}
+
+SetSendMode(mode) {
+    global injectMode
+    injectMode := mode
+    WriteConfig()
+    UpdateCompatChecks()
+    DebugLog("MODE CHANGED | " mode)
+    BoxNotify("success", "注入模式已切换为 " ModeLabel(mode))
+}
+
+ModeLabel(mode) {
+    switch mode {
+        case "play": return "SendPlay"
+        case "control": return "ControlSend"
+        default: return "SendInput"
+    }
+}
+
 UpdateTrayTip() {
-    global clipQueue, currentHotkey
+    global clipQueue
     n := clipQueue.Length
-    hk := FormatHotkey(currentHotkey)
     A_IconTip := n > 0
-        ? "连续粘贴 - 队列: " n " 项 (" hk ")"
-        : "连续粘贴 - 就绪 (" hk ")"
+        ? "连续粘贴 - 队列: " n " 项"
+        : "连续粘贴 - 就绪"
 }
 
 ShowQueue(*) {
@@ -117,8 +218,8 @@ ShowQueue(*) {
     n := clipQueue.Length
     if n = 0 {
         MsgBox("队列为空。"
-            "`n`n请先复制文本，然后按快捷键按顺序粘贴。"
-            "`n可在托盘菜单「设置」中自定义快捷键。",
+            "`n`n请先复制文本，然后按 Ctrl+V 按顺序粘贴。"
+            "`n想恢复普通粘贴，可先在托盘菜单清空队列。",
             "队列状态")
         return
     }
@@ -136,136 +237,15 @@ ClearQueue(*) {
     global clipQueue
     clipQueue := []
     UpdateTrayTip()
-    TrayTip("队列已清空。", "连续粘贴", "Iconi")
-    SetTimer(() => TrayTip(), -1500)
+    BoxNotify("success", "队列已清空。")
 }
 
-; ─── Settings GUI ───
-ShowSettings(*) {
-    global currentHotkey, autoExit
-    capturedHk := ""
-    sGui := Gui("+AlwaysOnTop +ToolWindow", "连续粘贴 - 设置")
-    sGui.SetFont("s10")
-    sGui.Add("Text", "w75 Section", "快捷键:")
-    hkEdit := sGui.Add("Edit", "x+m w150 h22 ReadOnly", FormatHotkey(currentHotkey))
-    hkBtn := sGui.Add("Button", "x+m w55", "录制")
-    sGui.Add("Text", "x+m w200 cGray", "点击「录制」后按新组合键")
-    sGui.Add("Text", "xs y+m", "自动退出:")
-    exitCb := sGui.Add("CheckBox", "x+m", "队列清空后自动退出脚本")
-    exitCb.Value := autoExit
-    sGui.Add("Text", "xs y+m", "")
-    sGui.Add("Button", "x+m w80 Default", "保存").OnEvent("Click", SaveSettings)
-    sGui.Add("Button", "x+m w80", "取消").OnEvent("Click", (*) => sGui.Destroy())
-    hkBtn.OnEvent("Click", (*) => StartCapture(sGui, hkEdit))
-    sGui.capturedHk := ""
-    sGui.exitCb := exitCb
-    sGui.Show("w480 h150")
-    return
-
-    SaveSettings(*) {
-        newHk := sGui.capturedHk
-        newExit := sGui.exitCb.Value
-        if newHk = ""
-            newHk := currentHotkey
-        currentHotkey := newHk
-        autoExit := newExit
-        WriteConfig()
-        sGui.Destroy()
-        Reload()
-    }
-}
-
-StartCapture(parentGui, editCtrl) {
-    global currentHotkey
-    Hotkey(currentHotkey, "Off")
-    recGui := Gui("+AlwaysOnTop +ToolWindow +Owner", "录制快捷键")
-    recGui.SetFont("s10 bold")
-    recGui.Add("Text", "w280", "请在键盘上按下新的快捷键组合")
-    recGui.SetFont("s9 norm")
-    recGui.Add("Text", "w280 cGray", "必须包含 Ctrl / Alt / Win 修饰键")
-    recGui.Add("Text", "w280 cGray", "按 Esc 取消")
-    status := recGui.Add("Text", "w280 cBlue", "等待输入...")
-    recGui.Show("w300 h120")
-    captured := ""
-    while !captured {
-        Sleep 50
-        if !WinExist(recGui)
-            break
-        if GetKeyState("Escape", "P") {
-            recGui.Destroy()
-            break
-        }
-        ctrl := GetKeyState("Ctrl", "P")
-        alt := GetKeyState("Alt", "P")
-        shift := GetKeyState("Shift", "P")
-        win := GetKeyState("LWin", "P") || GetKeyState("RWin", "P")
-        if !ctrl && !alt && !win
-            continue
-        key := DetectPressedKey()
-        if !key
-            continue
-        prefix := ""
-        if ctrl
-            prefix .= "^"
-        if alt
-            prefix .= "!"
-        if shift
-            prefix .= "+"
-        if win
-            prefix .= "#"
-        captured := prefix key
-        KeyWait(key)
-        Sleep 100
-    }
-    recGui.Destroy()
-    if captured {
-        editCtrl.Text := FormatHotkey(captured)
-        parentGui.capturedHk := captured
-    }
-    Hotkey(currentHotkey, PasteHandler)
-}
-
-DetectPressedKey() {
-    Loop 12 {
-        if GetKeyState("F" A_Index, "P")
-            return "F" A_Index
-    }
-    Loop 10 {
-        if GetKeyState("Numpad" (A_Index - 1), "P")
-            return "Numpad" (A_Index - 1)
-    }
-    Loop 26 {
-        key := Chr(0x60 + A_Index)
-        if GetKeyState(key, "P")
-            return key
-    }
-    for _, key in ["0","1","2","3","4","5","6","7","8","9"] {
-        if GetKeyState(key, "P")
-            return key
-    }
-    for _, key in ["Space", "Tab", "Enter", "Backspace", "Delete", "Insert", "Home", "End", "PgUp", "PgDn", "ScrollLock", "Pause", "PrintScreen", "AppsKey", "."] {
-        if GetKeyState(key, "P")
-            return key
-    }
-    return ""
-}
-
-FormatHotkey(hk) {
-    display := ""
-    if InStr(hk, "^")
-        display .= "Ctrl+"
-    if InStr(hk, "!")
-        display .= "Alt+"
-    if InStr(hk, "+")
-        display .= "Shift+"
-    if InStr(hk, "#")
-        display .= "Win+"
-    key := hk
-    for _, m in ["^", "!", "+", "#"]
-        key := StrReplace(key, m, "")
-    if SubStr(key, 1, 6) = "Numpad"
-        key := "小键盘" SubStr(key, 7)
-    else if StrLen(key) = 1
-        key := StrUpper(key)
-    return display key
+ToggleAutoExit(*) {
+    global autoExit
+    autoExit := !autoExit
+    WriteConfig()
+    if autoExit
+        A_TrayMenu.Check("自动退出 (&3)")
+    else
+        A_TrayMenu.Uncheck("自动退出 (&3)")
 }

@@ -4,7 +4,7 @@
 id = "2f039469-0978-48c9-96a6-9331859bb732"
 name = "连续粘贴"
 desc = "连续粘贴 - 自动监控剪贴板按顺序连续粘贴工具，AutoHotkey v2 脚本，通过不忙脚本盒子快捷键触发，支持批量复制集中粘贴、FIFO 队列管理、自定义快捷键设置，告别反复切换窗口提高办公效率"
-version = "1.0.0"
+version = "1.2.4"
 icon = "./imgs/logo.png"
 
 [bmscriptsbox.runtime]
